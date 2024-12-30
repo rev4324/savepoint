@@ -1,4 +1,4 @@
-package upload
+package s3
 
 import (
 	"archive/tar"
@@ -14,26 +14,10 @@ import (
 
 	"github.com/gosimple/slug"
 	"github.com/minio/minio-go/v7"
-	"github.com/rev4324/savepoint/configManager"
+	"github.com/rev4324/savepoint/config"
 )
 
-type Uploader interface {
-	Upload(context.Context, *configManager.OSSpecificGameConfig) error
-}
-
-type GameUploader struct {
-	config *configManager.Config
-	client *minio.Client
-}
-
-func New(client *minio.Client, config *configManager.Config) Uploader {
-	return &GameUploader{
-		config: config,
-		client: client,
-	}
-}
-
-func (u *GameUploader) Upload(ctx context.Context, game *configManager.OSSpecificGameConfig) error {
+func (u *S3Provider) Upload(ctx context.Context, game *config.OSSpecificGameConfig) error {
 	gameSlug := slug.Make(game.Name)
 
 	fmt.Printf("Endpoint: %s. GameId: %s\n", u.config.Bucket.Endpoint, gameSlug)
@@ -46,9 +30,10 @@ func (u *GameUploader) Upload(ctx context.Context, game *configManager.OSSpecifi
 	return nil
 }
 
-func (u *GameUploader) uploadDirectoryTar(ctx context.Context, sourcePath string, targetKeyPrefix string) error {
+func (u *S3Provider) uploadDirectoryTar(ctx context.Context, sourcePath string, targetKeyPrefix string) error {
 	rootDirName := filepath.Base(sourcePath)
 	key := filepath.Join(targetKeyPrefix, fmt.Sprintf("%s.tar", rootDirName))
+	key = filepath.ToSlash(key)
 
 	tempFile, err := os.CreateTemp("", slug.Make(sourcePath))
 	if err != nil {
@@ -96,7 +81,7 @@ func (u *GameUploader) uploadDirectoryTar(ctx context.Context, sourcePath string
 	return nil
 }
 
-func (u *GameUploader) uploadDirectory(ctx context.Context, sourcePath string, targetKeyPrefix string) error {
+func (u *S3Provider) uploadDirectory(ctx context.Context, sourcePath string, targetKeyPrefix string) error {
 	paths := make(chan string, 1000)
 	results := make(chan error, 1000)
 	rootDirName := filepath.Base(sourcePath)
@@ -114,7 +99,7 @@ func (u *GameUploader) uploadDirectory(ctx context.Context, sourcePath string, t
 					results <- fmt.Errorf("error getting relative path for %s: %w", path, err)
 				}
 
-				targetPath := filepath.Join(targetKeyPrefix, rootDirName, rel)
+				targetPath := filepath.ToSlash(filepath.Join(targetKeyPrefix, rootDirName, rel))
 
 				err = uploadFile(ctx, u.client, u.config.Bucket.Bucket, path, targetPath)
 				if err != nil {
@@ -184,7 +169,7 @@ func uploadFile(ctx context.Context, client *minio.Client, bucket, filePath stri
 	uploadInfo, err := client.PutObject(ctx, bucket, targetPath, file, info.Size(),
 		minio.PutObjectOptions{ContentType: contentType})
 
-	fmt.Printf("Successfully uploaded %s\n", uploadInfo.Key)
+	log.Printf("Successfully uploaded %s of size %d bytes\n", uploadInfo.Key, uploadInfo.Size)
 	if err != nil {
 		return fmt.Errorf("putting object: %w", err)
 	}
