@@ -1,87 +1,52 @@
 package s3
 
 import (
-	"archive/tar"
 	"context"
 	"fmt"
-	"io"
 	"io/fs"
-	"log"
 	"mime"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
+	"github.com/charmbracelet/log"
 	"github.com/gosimple/slug"
 	"github.com/minio/minio-go/v7"
 	"github.com/rev4324/savepoint/config"
+	"github.com/rev4324/savepoint/utils"
 )
+
+type UploadStats struct {
+	Successful int32
+	Errors     []error
+	TotalBytes int64
+	Duration   time.Duration
+}
 
 func (u *S3Provider) Upload(ctx context.Context, game *config.OSSpecificGameConfig) error {
 	gameSlug := slug.Make(game.Name)
 
-	fmt.Printf("Endpoint: %s. GameId: %s\n", u.config.Bucket.Endpoint, gameSlug)
+	log.Info("Starting upload", "endpoint", u.config.Bucket.Endpoint, "game", game.Name)
 
-	err := u.uploadDirectory(ctx, game.SaveDir, gameSlug)
-	if err != nil {
-		return err
+	stats := u.uploadDirectory(ctx, game.SaveDir, gameSlug)
+
+	if len(stats.Errors) > 0 {
+		return fmt.Errorf("encountered multiple upload errors: %v", stats.Errors)
 	}
+
+	fmt.Println()
+	log.Infof("Successful: %d files", stats.Successful)
+	log.Infof("Total bytes transferred: %s", utils.ByteCountBinary(stats.TotalBytes))
+	log.Infof("Took %fs", stats.Duration.Seconds())
+	log.Infof("Average speed: %s/s", utils.ByteCountBinary(stats.TotalBytes/int64(stats.Duration.Seconds())))
 
 	return nil
 }
 
-func (u *S3Provider) uploadDirectoryTar(ctx context.Context, sourcePath string, targetKeyPrefix string) error {
-	rootDirName := filepath.Base(sourcePath)
-	key := filepath.Join(targetKeyPrefix, fmt.Sprintf("%s.tar", rootDirName))
-	key = filepath.ToSlash(key)
-
-	tempFile, err := os.CreateTemp("", slug.Make(sourcePath))
-	if err != nil {
-		return err
-	}
-	defer tempFile.Close()
-	defer os.Remove(tempFile.Name())
-
-	log.Printf("created temp file: %s\n", tempFile.Name())
-
-	tarWriter := tar.NewWriter(tempFile)
-	defer tarWriter.Close()
-	defer os.Remove(tempFile.Name())
-
-	sourceDirFs := os.DirFS(sourcePath)
-	err = addDirFSIgnoreLinks(sourceDirFs, tarWriter)
-	if err != nil {
-		return err
-	}
-
-	log.Println("compressed data into the temp file")
-
-	tempFileStat, err := tempFile.Stat()
-	if err != nil {
-		return err
-	}
-
-	tempFile.Sync()
-	_, err = tempFile.Seek(0, io.SeekStart)
-	if err != nil {
-		return err
-	}
-
-	info, err := u.client.PutObject(ctx, u.config.Bucket.Bucket, key, tempFile, tempFileStat.Size(), minio.PutObjectOptions{
-		ContentType:           "application/x-tar",
-		NumThreads:            100,
-		ConcurrentStreamParts: true,
-	})
-	if err != nil {
-		return err
-	}
-
-	log.Printf("succesfully uploaded tarball %s to bucket %s with size %d\n", info.Key, info.Bucket, info.Size)
-
-	return nil
-}
-
-func (u *S3Provider) uploadDirectory(ctx context.Context, sourcePath string, targetKeyPrefix string) error {
+func (u *S3Provider) uploadDirectory(ctx context.Context, sourcePath string, targetKeyPrefix string) UploadStats {
+	var stats UploadStats
+	start := time.Now()
 	paths := make(chan string, 1000)
 	results := make(chan error, 1000)
 	rootDirName := filepath.Base(sourcePath)
@@ -101,10 +66,12 @@ func (u *S3Provider) uploadDirectory(ctx context.Context, sourcePath string, tar
 
 				targetPath := filepath.ToSlash(filepath.Join(targetKeyPrefix, rootDirName, rel))
 
-				err = uploadFile(ctx, u.client, u.config.Bucket.Bucket, path, targetPath)
+				size, err := uploadFile(ctx, u.client, u.config.Bucket.Bucket, path, targetPath)
 				if err != nil {
 					results <- fmt.Errorf("error uploading %s: %w", path, err)
 				}
+				stats.TotalBytes += size
+				stats.Successful += 1
 			}
 		}()
 	}
@@ -134,30 +101,28 @@ func (u *S3Provider) uploadDirectory(ctx context.Context, sourcePath string, tar
 
 	go func() {
 		wg.Wait()
+		stats.Duration = time.Since(start)
+
 		close(results)
 	}()
 
-	var errs []error
 	for err := range results {
-		errs = append(errs, err)
+		stats.Errors = append(stats.Errors, err)
 	}
 
-	if len(errs) > 0 {
-		return fmt.Errorf("upload errors: %v", errs)
-	}
-	return nil
+	return stats
 }
 
-func uploadFile(ctx context.Context, client *minio.Client, bucket, filePath string, targetPath string) error {
+func uploadFile(ctx context.Context, client *minio.Client, bucket, filePath string, targetPath string) (int64, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
-		return fmt.Errorf("opening file: %w", err)
+		return 0, fmt.Errorf("opening file: %w", err)
 	}
 	defer file.Close()
 
 	info, err := file.Stat()
 	if err != nil {
-		return fmt.Errorf("getting file info: %w", err)
+		return 0, fmt.Errorf("getting file info: %w", err)
 	}
 
 	ext := filepath.Ext(filePath)
@@ -169,44 +134,10 @@ func uploadFile(ctx context.Context, client *minio.Client, bucket, filePath stri
 	uploadInfo, err := client.PutObject(ctx, bucket, targetPath, file, info.Size(),
 		minio.PutObjectOptions{ContentType: contentType})
 
-	log.Printf("Successfully uploaded %s of size %d bytes\n", uploadInfo.Key, uploadInfo.Size)
+	log.Info("Uploaded", "key", uploadInfo.Key, "size", uploadInfo.Size, "path", info.Name())
 	if err != nil {
-		return fmt.Errorf("putting object: %w", err)
+		return 0, fmt.Errorf("putting object: %w", err)
 	}
 
-	return nil
-}
-
-func addDirFSIgnoreLinks(fsys fs.FS, tw *tar.Writer) error {
-	return fs.WalkDir(fsys, ".", func(name string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-
-		if !info.Mode().IsRegular() {
-			return nil
-		}
-		h, err := tar.FileInfoHeader(info, "")
-		if err != nil {
-			return err
-		}
-		h.Name = name
-		if err := tw.WriteHeader(h); err != nil {
-			return err
-		}
-		f, err := fsys.Open(name)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		_, err = io.Copy(tw, f)
-		return err
-	})
+	return uploadInfo.Size, nil
 }

@@ -2,10 +2,10 @@ package config
 
 import (
 	"encoding/json"
-	"log"
 	"os"
 	"path/filepath"
 
+	"github.com/charmbracelet/log"
 	"github.com/rev4324/savepoint/validator"
 )
 
@@ -55,7 +55,7 @@ func Parse() (*Config, error) {
 		return nil, err
 	}
 
-	log.Printf("config path is at %s\n", path)
+	log.Debugf("Config path is at %s", path)
 
 	fileReader, err := os.Open(path)
 	if err != nil {
