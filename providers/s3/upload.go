@@ -15,6 +15,7 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/rev4324/savepoint/config"
 	"github.com/rev4324/savepoint/utils"
+	"github.com/schollz/progressbar/v3"
 )
 
 type UploadStats struct {
@@ -50,8 +51,10 @@ func (u *S3Provider) uploadDirectory(ctx context.Context, sourcePath string, tar
 	paths := make(chan string, 1000)
 	results := make(chan error, 1000)
 	rootDirName := filepath.Base(sourcePath)
+	count := 0
+	bar := progressbar.NewOptions(-1, progressbar.OptionSetWidth(15))
 
-	const numWorkers = 100
+	const numWorkers = 1000
 	var wg sync.WaitGroup
 
 	for i := 0; i < numWorkers; i++ {
@@ -70,8 +73,11 @@ func (u *S3Provider) uploadDirectory(ctx context.Context, sourcePath string, tar
 				if err != nil {
 					results <- fmt.Errorf("error uploading %s: %w", path, err)
 				}
+
 				stats.TotalBytes += size
 				stats.Successful += 1
+				bar.Add(1)
+				bar.Describe(fmt.Sprintf("[%d/%d] %s", stats.Successful, count, targetPath))
 			}
 		}()
 	}
@@ -83,6 +89,7 @@ func (u *S3Provider) uploadDirectory(ctx context.Context, sourcePath string, tar
 				return err
 			}
 			if !entry.IsDir() {
+				count += 1
 				select {
 				case paths <- path:
 				case <-ctx.Done():
@@ -134,7 +141,7 @@ func uploadFile(ctx context.Context, client *minio.Client, bucket, filePath stri
 	uploadInfo, err := client.PutObject(ctx, bucket, targetPath, file, info.Size(),
 		minio.PutObjectOptions{ContentType: contentType})
 
-	log.Info("Uploaded", "key", uploadInfo.Key, "size", uploadInfo.Size, "path", info.Name())
+	log.Debug("Uploaded", "key", uploadInfo.Key, "size", uploadInfo.Size, "path", info.Name())
 	if err != nil {
 		return 0, fmt.Errorf("putting object: %w", err)
 	}
